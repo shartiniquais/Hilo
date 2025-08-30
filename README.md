@@ -28,13 +28,13 @@ It manages turn flow, validates inputs, resolves HILOs, scores rounds, and provi
 
 - Each player has a **3×3 grid**. At setup, each player **reveals two** positions (row/col 0..2) and inputs their **color+value**.
 - After all players have revealed, **one card is revealed** and placed on the **discard** to start the round.
-- **Starting player** is the one with the **lowest sum** of their two revealed cards (ties by table order).
+- **Starting player** is the one with the **highest sum** of their two revealed cards (ties by table order).
 - On your turn: **take discard** (must place) **or draw** (place or discard; if you discard a drawn card, you **must flip** one hidden cell).
 - **HILO**: 3 visible cards of the **same color** aligned in row/column/diagonal → remove those 3; place them on the discard with **smallest value on top**.  
   If diagonal, **compact** immediately either **vertically** (two rows of three) or **horizontally** (two columns of three), then re‑scan for chains.
 - **End of round**: when a player has no hidden cards (or no cards), others take **one last turn**. Reveal all, resolve HILOs, sum values.  
   The **trigger** doubles **unless** they have the **unique** strictly‑lowest total (tie on lowest → still doubles).  
-  Play rounds until someone reaches **100+**; the lowest total wins (ties allowed).
+  Play rounds until someone reaches `SCORE_LIMIT` (default 10; set to 100 for full games); the lowest total wins (ties allowed).
 
 ---
 
@@ -54,6 +54,8 @@ Optional demo mode:
 python hilo.py --demo
 ```
 
+Note: `--demo` currently prints a banner to indicate demo mode but does not change the configured players or scoring by itself. Adjust the config at the top of `hilo.py` as needed (see below).
+
 ---
 
 ## ⚙️ Configuration (top of file)
@@ -63,7 +65,7 @@ python hilo.py --demo
 PLAYERS = [
     {"kind": "H",  "name": "You"},
     {"kind": "AI", "name": "Bot A"},
-    {"kind": "X",  "name": ""},
+    {"kind": "AI", "name": "Bot B"},
     {"kind": "X",  "name": ""},
 ]
 
@@ -75,6 +77,9 @@ PRINT_PROBA: bool = True        # show EV/probability analysis
 PRINT_TOP_K: int = 3            # show top-K placements
 PRINT_PROBA_PREC: int = 3       # decimals for probabilities
 
+# Scoring limit (end game when any player reaches this total)
+SCORE_LIMIT = 10  # set to 100 for full-length games
+
 # Color legend
 COLOR_MAP = {
     "R": "Red", "B": "Blue", "G": "Green", "Y": "Yellow",
@@ -82,7 +87,9 @@ COLOR_MAP = {
 }
 ```
 
-> **Hint:** Set `"X"` for unused player slots. Only non‑`"X"` entries are used to build the table (2–4 players).
+> **Hints:**
+> - Set `"X"` for unused player slots. Only non‑`"X"` entries are used to build the table (2–4 players).
+> - For a full game, change `SCORE_LIMIT` to `100` (the current default is `10` for quick demos/tests).
 
 ---
 
