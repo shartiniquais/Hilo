@@ -785,6 +785,8 @@ class Game:
             self.put_on_discard(trio)
             if typ == "diag":
                 mode = self.choose_best_compaction(g)
+                # Announce how the AI compacted after a diagonal HILO
+                print(f"AI_COMPACT: diag -> {mode}")
                 g.compact_after_diag(mode)
 
     def _lines_through(self, r: int, c: int) -> List[List[GridPos]]:
