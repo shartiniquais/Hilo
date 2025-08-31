@@ -1,4 +1,4 @@
-from .types import Card, GridPos, PlayerKind, COLOR_MAP
+from .types import Card, GridPos, PlayerKind, COLOR_MAP, PendingAction, PendingKind
 from .deck import DeckTracker
 from .grid import Grid
 from .ai import CandidateEval, evaluate_best_place
@@ -7,6 +7,8 @@ from .core import (
     GameConfig,
     ExplainInfo,
     GameState,
+    step,
+    resolve,
     to_json,
     from_json,
     new_game,
@@ -33,6 +35,10 @@ __all__ = [
     "GameConfig",
     "ExplainInfo",
     "GameState",
+    "PendingAction",
+    "PendingKind",
+    "step",
+    "resolve",
     "to_json",
     "from_json",
     "new_game",

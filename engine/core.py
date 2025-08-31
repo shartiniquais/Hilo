@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple, Literal, Sequence, Dict, Any, Mapping, cast
 
-from .types import Card, GridPos, PlayerKind, COLOR_MAP
+from .types import Card, GridPos, PlayerKind, COLOR_MAP, PendingAction, PendingKind
 from .grid import Grid, apply_hilo_chain_pure, choose_best_compaction_pure
 from .deck import DeckTracker
 from .ai import CandidateEval, evaluate_best_place
@@ -68,6 +68,13 @@ class GameState:
     end_trigger_idx: Optional[int] = None
     logs: List[str] = field(default_factory=list)
     explain: Optional[ExplainInfo] = None
+    # Event system
+    pending: List[PendingAction] = field(default_factory=list)
+    _next_action_seq: int = 1
+    _phase: Literal["setup_reveals", "setup_discard", "playing"] = "setup_reveals"
+    _setup_reveals_done: Dict[str, int] = field(default_factory=dict)
+    _human_ctx: Dict[str, Any] = field(default_factory=dict)
+    _ai_ctx: Dict[str, Any] = field(default_factory=dict)
 
 
 def new_game(cfg: GameConfig) -> GameState:
@@ -84,6 +91,12 @@ def new_game(cfg: GameConfig) -> GameState:
         end_trigger_idx=None,
         logs=[],
         explain=None,
+        pending=[],
+        _next_action_seq=1,
+        _phase="setup_reveals",
+        _setup_reveals_done={},
+        _human_ctx={},
+        _ai_ctx={},
     )
     return state
 
@@ -132,6 +145,7 @@ def is_round_over(state: GameState) -> bool:
 
 
 def _apply_hilo_chain(state: GameState, g: Grid) -> None:
+    # Eventful: resolve chains; pause for diagonal compaction decision
     while True:
         lines = g.find_hilo_lines()
         if not lines:
@@ -145,9 +159,9 @@ def _apply_hilo_chain(state: GameState, g: Grid) -> None:
         typ = g.remove_line(line)
         _put_on_discard(state, trio)
         if typ == "diag":
-            mode = choose_best_compaction_pure(g)
-            _append_log(state, f"HILO_COMPACT: diag -> {mode}")
-            g.compact_after_diag(mode)
+            # Request compaction decision from arbiter
+            _push_pending(state, kind="choose_diag_compact", player_id=_player(state).id, payload={"options": ["vertical", "horizontal"]})
+            return
 
 
 def apply_human_action(
@@ -522,6 +536,16 @@ def to_json(state: GameState) -> Dict[str, object]:
         pick_obj: Dict[str, object] = {"reason": state.explain.pick_reason}
         explain_obj = {"topK": topk_list, "pick": pick_obj}
 
+    # Pending actions
+    pendings: List[Dict[str, object]] = []
+    for pa in state.pending:
+        pendings.append({
+            "id": pa.id,
+            "kind": pa.kind,
+            "playerId": pa.playerId,
+            "payload": pa.payload,
+        })
+
     data: Dict[str, object] = {
         "schemaVersion": 1,
         "config": cfg_obj,
@@ -531,6 +555,7 @@ def to_json(state: GameState) -> Dict[str, object]:
         "discardTop": discard_top_obj,
         "deckSummary": deck_summary,
         "logs": list(state.logs),
+        "pending": pendings,
     }
     if explain_obj is not None:
         data["explain"] = explain_obj
@@ -720,5 +745,334 @@ def from_json(data: Dict[str, object]) -> GameState:
                 except Exception:
                     # Best-effort; ignore malformed lines
                     pass
+    
+    # Pending actions (deserialize best-effort)
+    p_list = data.get("pending", [])
+    state.pending = []
+    if isinstance(p_list, list):
+        for itm in p_list:
+            if not isinstance(itm, dict):
+                continue
+            kid = str(itm.get("id", ""))
+            kk = str(itm.get("kind", ""))
+            pid = str(itm.get("playerId", ""))
+            payload = itm.get("payload", {})
+            if not isinstance(payload, dict):
+                payload = {}
+            try:
+                state.pending.append(PendingAction(kind=cast(PendingKind, kk), playerId=pid, payload=payload, id=kid))
+            except Exception:
+                # ignore malformed entries
+                pass
 
     return state
+
+
+# --- Event system: step + resolve ---
+
+def _next_id(state: GameState) -> str:
+    i = state._next_action_seq
+    state._next_action_seq += 1
+    return f"a{i}"
+
+
+def _push_pending(state: GameState, *, kind: PendingKind, player_id: str, payload: Dict[str, Any]) -> PendingAction:
+    pa = PendingAction(kind=kind, playerId=player_id, payload=payload, id=_next_id(state))
+    state.pending.append(pa)
+    return pa
+
+
+def _next_idx(state: GameState) -> int:
+    n = len(state.players)
+    return (state.current_idx + 1) % n
+
+
+def _first_hidden(g: Grid) -> GridPos:
+    for r in range(3):
+        for c in range(3):
+            if g.cells[r][c] is not None and not g.visible[r][c]:
+                return (r, c)
+    for r in range(3):
+        for c in range(3):
+            if g.cells[r][c] is not None:
+                return (r, c)
+    return (0, 0)
+
+
+def _setup_find_next_reveal_pos(g: Grid) -> Optional[GridPos]:
+    for r in range(3):
+        for c in range(3):
+            if g.cells[r][c] is not None and not g.visible[r][c]:
+                return (r, c)
+    return None
+
+
+def step(state: GameState) -> None:
+    """
+    Progress game logic until either:
+    - a new PendingAction is created, OR
+    - the round ends (no pending).
+    """
+    if state.pending:
+        return
+    # Setup: two reveals per player
+    if state._phase == "setup_reveals":
+        for p in state.players:
+            state._setup_reveals_done.setdefault(p.id, 0)
+        for p in state.players:
+            if state._setup_reveals_done.get(p.id, 0) < 2:
+                pos = _setup_find_next_reveal_pos(p.grid)
+                if pos is None:
+                    state._setup_reveals_done[p.id] = 2
+                    continue
+                r, c = pos
+                _push_pending(state, kind="reveal_card", player_id=p.id, payload={"context": "initial_reveal", "r": r, "c": c})
+                return
+        state._phase = "setup_discard"
+    if state._phase == "setup_discard":
+        _push_pending(state, kind="reveal_card", player_id=state.players[0].id, payload={"context": "initial_discard"})
+        return
+    # Playing
+    if state._phase == "playing":
+        if is_round_over(state):
+            return
+        p = _player(state)
+        g = p.grid
+        top = _top_discard(state)
+        if p.kind == "H":
+            hc = state._human_ctx
+            if not hc:
+                choices = ["draw"] if top is None else ["discard", "draw"]
+                _push_pending(state, kind="choose_action", player_id=p.id, payload={"allowed": choices, "context": "turn_action"})
+                return
+            act = hc.get("action")
+            if act == "discard":
+                if "target" not in hc:
+                    _push_pending(state, kind="choose_pos", player_id=p.id, payload={"context": "take_discard_target"})
+                    return
+                tr, tc = cast(GridPos, hc["target"])
+                if not g.visible[tr][tc]:
+                    _push_pending(state, kind="replace_hidden_card", player_id=p.id, payload={"r": tr, "c": tc})
+                    return
+                apply_human_action(state, action="take_discard", target=(tr, tc))
+                maybe_trigger_end(state)
+                state._human_ctx = {}
+                if not state.pending:
+                    state.current_idx = _next_idx(state)
+                return
+            if act == "draw":
+                if "drawn" not in hc:
+                    _push_pending(state, kind="reveal_card", player_id=p.id, payload={"context": "drawn"})
+                    return
+                if "after_draw_choice" not in hc:
+                    _push_pending(state, kind="choose_action", player_id=p.id, payload={"allowed": ["place", "discard"], "context": "after_draw"})
+                    return
+                if hc["after_draw_choice"] == "place":
+                    if "target" not in hc:
+                        _push_pending(state, kind="choose_pos", player_id=p.id, payload={"context": "place_target"})
+                        return
+                    tr, tc = cast(GridPos, hc["target"])
+                    if not g.visible[tr][tc]:
+                        _push_pending(state, kind="replace_hidden_card", player_id=p.id, payload={"r": tr, "c": tc})
+                        return
+                    apply_human_action(state, action="draw_place", target=(tr, tc), drawn=cast(Card, hc["drawn"]))
+                    maybe_trigger_end(state)
+                    state._human_ctx = {}
+                    if not state.pending:
+                        state.current_idx = _next_idx(state)
+                    return
+                else:
+                    if "flip_pos" not in hc:
+                        _push_pending(state, kind="choose_pos", player_id=p.id, payload={"context": "flip_target_hidden"})
+                        return
+                    fr, fc = cast(GridPos, hc["flip_pos"])
+                    _push_pending(state, kind="reveal_card", player_id=p.id, payload={"context": "flip_reveal", "r": fr, "c": fc})
+                    return
+        else:  # AI
+            ac = state._ai_ctx
+            if not ac:
+                action, kwargs, info = ai_decide(state)
+                state.explain = info
+                ac.update({"decided": action, "kwargs": kwargs})
+            action = cast(str, state._ai_ctx.get("decided"))
+            if action == "take_discard":
+                target = cast(GridPos, state._ai_ctx["kwargs"].get("target"))
+                r, c = target
+                if not g.visible[r][c]:
+                    _push_pending(state, kind="ai_reveal_needed", player_id=p.id, payload={"what": "replaced_hidden", "r": r, "c": c})
+                    return
+                ai_apply(state, "take_discard", target=target)
+                state._ai_ctx = {}
+                maybe_trigger_end(state)
+                if not state.pending:
+                    state.current_idx = _next_idx(state)
+                return
+            else:  # draw path
+                if "drawn" not in ac:
+                    _push_pending(state, kind="ai_reveal_needed", player_id=p.id, payload={"what": "drawn"})
+                    return
+                drawn = cast(Card, ac["drawn"])  # type: ignore[assignment]
+                (score, pos), best_cand, _cands = evaluate_best_place(
+                    g,
+                    drawn,
+                    state.deck,
+                    state.cfg.ai_depth,
+                    state.cfg.ai_mc_samples,
+                    state.cfg.ai_mc_seed,
+                    top_discard=top,
+                )
+                r, c = pos
+                can_flip = g.count_hidden() > 0
+                exp_draw = state.deck.expected_value_unseen()
+                ev_after_draw_place = best_cand.baseline + best_cand.ev_delta
+                ev_after_draw_discard = float(g.known_sum()) + (exp_draw if can_flip else 0.0)
+                place = (not can_flip) or (ev_after_draw_place <= ev_after_draw_discard)
+                if place:
+                    if not g.visible[r][c]:
+                        _push_pending(state, kind="ai_reveal_needed", player_id=p.id, payload={"what": "replaced_hidden", "r": r, "c": c})
+                        state._ai_ctx["target"] = (r, c)
+                        return
+                    ai_apply(state, "draw_place", drawn=drawn, target=(r, c))
+                    state._ai_ctx = {}
+                    maybe_trigger_end(state)
+                    if not state.pending:
+                        state.current_idx = _next_idx(state)
+                    return
+                else:
+                    fr, fc = _first_hidden(g)
+                    _push_pending(state, kind="ai_reveal_needed", player_id=p.id, payload={"what": "flipped_card", "r": fr, "c": fc, "drawn": {"c": drawn.c, "v": drawn.v}})
+                    state._ai_ctx["flip_pos"] = (fr, fc)
+                    return
+
+
+def resolve(state: GameState, actionId: str, response: Dict[str, Any]) -> None:
+    """
+    Consume a PendingAction by ID, apply the given response to game state,
+    clear it from pending, and continue progression (via step).
+    """
+    idx = next((i for i, a in enumerate(state.pending) if a.id == actionId), -1)
+    assert idx >= 0, "Pending action not found"
+    pa = state.pending.pop(idx)
+    kind = pa.kind
+    pid = pa.playerId
+    p = next(p for p in state.players if p.id == pid)
+    g = p.grid
+
+    if kind == "reveal_card":
+        col = response.get("c")
+        val = response.get("v")
+        assert isinstance(col, str) and isinstance(val, int)
+        card = Card(col, int(val))
+        ctx = pa.payload.get("context")
+        if ctx == "initial_reveal":
+            rr = int(pa.payload["r"])  # provided by step payload
+            cc = int(pa.payload["c"])  # provided by step payload
+            state.deck.see_card(card)
+            g.reveal_known(rr, cc, card)
+            state._setup_reveals_done[pid] = state._setup_reveals_done.get(pid, 0) + 1
+        elif ctx == "initial_discard":
+            state.discard = []
+            _put_on_discard(state, [card])
+            _append_log(state, f"INIT_DISCARD: {card}")
+            # Determine starting player by lowest two sum
+            # Will be computed after returning to step()
+        elif ctx == "drawn":
+            state.deck.see_card(card)
+            state._human_ctx["drawn"] = card
+        elif ctx == "flip_reveal":
+            rr = int(pa.payload["r"])  # provided by step payload
+            cc = int(pa.payload["c"])  # provided by step payload
+            state.deck.see_card(card)
+            g.reveal_known(rr, cc, card)
+            draw_card = cast(Optional[Card], state._human_ctx.get("drawn"))
+            assert draw_card is not None
+            apply_human_action(state, action="draw_discard_flip", drawn=draw_card, flipped=(rr, cc), flipped_card=card)
+            state._human_ctx = {}
+    elif kind == "replace_hidden_card":
+        r = int(pa.payload["r"])  # provided by step payload
+        c = int(pa.payload["c"])  # provided by step payload
+        col = response.get("c")
+        val = response.get("v")
+        assert isinstance(col, str) and isinstance(val, int)
+        card = Card(col, int(val))
+        state.deck.see_card(card)
+        hc = state._human_ctx
+        if hc.get("action") == "discard":
+            apply_human_action(state, action="take_discard", target=(r, c), replaced_hidden=card)
+            state._human_ctx = {}
+        else:
+            drawn = cast(Optional[Card], hc.get("drawn"))
+            assert drawn is not None
+            apply_human_action(state, action="draw_place", target=(r, c), drawn=drawn, replaced_hidden=card)
+            state._human_ctx = {}
+    elif kind == "choose_action":
+        choice = str(response["choice"])  # required
+        ctx = pa.payload.get("context")
+        if ctx == "turn_action":
+            state._human_ctx = {"action": choice}
+        elif ctx == "after_draw":
+            state._human_ctx["after_draw_choice"] = choice
+    elif kind == "choose_pos":
+        r = int(response["row"])  # required
+        c = int(response["col"])  # required
+        ctx = pa.payload.get("context")
+        if ctx in ("take_discard_target", "place_target"):
+            state._human_ctx["target"] = (r, c)
+        elif ctx == "flip_target_hidden":
+            state._human_ctx["flip_pos"] = (r, c)
+    elif kind == "ai_reveal_needed":
+        what = str(pa.payload.get("what"))
+        col = response.get("c")
+        val = response.get("v")
+        assert isinstance(col, str) and isinstance(val, int)
+        card = Card(col, int(val))
+        state.deck.see_card(card)
+        ac = state._ai_ctx
+        if what == "drawn":
+            ac["drawn"] = card
+        elif what == "replaced_hidden":
+            ac["replaced_hidden"] = card
+            decided = cast(str, ac.get("decided", ""))
+            if decided == "take_discard":
+                target = cast(GridPos, ac.get("kwargs", {}).get("target"))
+                ai_apply(state, "take_discard", target=target, replaced_hidden=card)
+                state._ai_ctx = {}
+            elif decided == "draw":
+                tgt = cast(Optional[GridPos], ac.get("target"))
+                if tgt is not None:
+                    ai_apply(state, "draw_place", drawn=cast(Card, ac.get("drawn")), target=tgt, replaced_hidden=card)
+                    state._ai_ctx = {}
+        elif what == "flipped_card":
+            rr = int(pa.payload["r"])  # provided by step payload
+            cc = int(pa.payload["c"])  # provided by step payload
+            drawn = cast(Card, ac.get("drawn"))
+            ai_apply(state, "draw_discard_flip", drawn=drawn, flipped=(rr, cc), flipped_card=card)
+            state._ai_ctx = {}
+    elif kind == "choose_diag_compact":
+        choice = str(response["choice"])  # required
+        assert choice in ("vertical", "horizontal")
+        g.compact_after_diag(cast(Literal["vertical", "horizontal"], choice))
+        _append_log(state, f"HILO_COMPACT: diag -> {choice}")
+
+    # After resolving, potentially advance phase
+    if state._phase == "setup_discard" and not state.pending:
+        # Compute starting player by lowest two visible sum
+        start_sums: List[Tuple[int, int]] = []
+        for idx, pp in enumerate(state.players):
+            cnt = 0
+            ssum = 0
+            for r in range(3):
+                for c in range(3):
+                    if pp.grid.cells[r][c] is not None and pp.grid.visible[r][c]:
+                        ssum += cast(Card, pp.grid.cells[r][c]).v
+                        cnt += 1
+                        if cnt >= 2:
+                            break
+                if cnt >= 2:
+                    break
+            start_sums.append((ssum, idx))
+        state.current_idx = min(start_sums, key=lambda t: t[0])[1] if start_sums else 0
+        state._phase = "playing"
+
+    # Continue progression
+    step(state)

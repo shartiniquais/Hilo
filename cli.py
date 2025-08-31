@@ -11,16 +11,12 @@ from engine import (
     GameConfig,
     GameState,
     new_game,
-    start_round,
-    is_round_over,
-    apply_human_action,
-    ai_decide,
-    ai_apply,
-    maybe_trigger_end,
+    step,
+    resolve,
     finish_round_and_score,
     is_game_over,
     COLOR_MAP,
-    evaluate_best_place,
+    to_json,
 )
 
 
@@ -138,122 +134,54 @@ def drain_logs(state: GameState) -> None:
     state.logs.clear()
 
 
-def human_turn(state: GameState) -> None:
-    p = state.players[state.current_idx]
-    g = p.grid
-    print()
-    print_legend()
-    print(f"Turn: {p.name}")
-    top = state.discard[-1] if state.discard else None
-    print(f"Discard top: {top if top else '(empty)'}")
-    print_grid(g, f"{p.name}'s grid")
-
-    action: Optional[str] = None
-    while action not in ("discard", "draw"):
-        a = input("Action (take 'discard' or 'draw'): ").strip().lower()
-        if a in ("discard", "draw"):
-            action = a
-    if action == "discard":
-        if top is None:
-            print("Discard is empty; you must draw.")
-            action = "draw"
-        else:
-            r, c = ask_pos_any()
-            replaced = g.cells[r][c]
-            replaced_hidden: Optional[Card] = None
-            if replaced is None:
-                print("That cell is empty; pick a non-empty position.")
-                return human_turn(state)
-            if not g.visible[r][c]:
-                replaced_hidden = ask_card("Replaced hidden card (color+value):")
-            apply_human_action(state,
-                               action="take_discard",
-                               target=(r, c),
-                               replaced_hidden=replaced_hidden)
-            drain_logs(state)
-            return
-
-    # draw branch
-    drawn = ask_card("Drawn card (color+value):")
+def handle_pending(state: GameState) -> None:
+    # Poll pending and ask user to resolve one by one
     while True:
-        sub = input("Place or discard? (p/d): ").strip().lower()
-        if sub in ("p", "d"):
+        step(state)
+        data = to_json(state)
+        pend = data.get("pending", [])
+        if not pend:
             break
-    if sub == "p":
-        r, c = ask_pos_any()
-        replaced_hidden: Optional[Card] = None
-        if not g.visible[r][c]:
-            replaced_hidden = ask_card("Replaced hidden card (color+value):")
-        apply_human_action(state,
-                           action="draw_place",
-                           target=(r, c),
-                           drawn=drawn,
-                           replaced_hidden=replaced_hidden)
-    else:
-        r, c = ask_pos_hidden(g)
-        flip = ask_card("Revealed card (color+value):")
-        apply_human_action(state,
-                           action="draw_discard_flip",
-                           drawn=drawn,
-                           flipped=(r, c),
-                           flipped_card=flip)
-    drain_logs(state)
-
-
-def ai_turn(state: GameState) -> None:
-    p = state.players[state.current_idx]
-    g = p.grid
-    print()
-    print_legend()
-    print(f"Turn: {p.name} [AI]")
-    top = state.discard[-1] if state.discard else None
-    print(f"Discard top: {top if top else '(empty)'}")
-    print_grid(g, f"{p.name}'s grid")
-
-    action, kwargs, info = ai_decide(state)
-    if info.pick_reason:
-        print(info.pick_reason)
-    if action == "take_discard":
-        ai_apply(state, action, **kwargs)
+        assert isinstance(pend, list)
+        pa = pend[0]
+        kid = pa["id"]
+        kind = pa["kind"]
+        payload = pa.get("payload", {})
+        player_id = pa.get("playerId")
+        p = next(pp for pp in state.players if pp.id == player_id)
+        print()
+        print_legend()
+        print(f"Pending for {p.name} [{kind}]")
+        # Show grid snapshot for that player
+        print_grid(p.grid, f"{p.name}'s grid")
+        if kind == "choose_action":
+            allowed = payload.get("allowed", [])
+            while True:
+                choice = input(f"Choose action {allowed}: ").strip().lower()
+                if choice in allowed:
+                    break
+            resolve(state, kid, {"choice": choice})
+        elif kind == "choose_pos":
+            r, c = ask_pos_any()
+            resolve(state, kid, {"row": r, "col": c})
+        elif kind in ("reveal_card", "replace_hidden_card", "ai_reveal_needed"):
+            card = ask_card("Provide card (color+value):")
+            resolve(state, kid, {"c": card.c, "v": card.v})
+        elif kind == "choose_diag_compact":
+            while True:
+                s = input("Compaction 'vertical' or 'horizontal': ").strip().lower()
+                if s in ("vertical", "horizontal"):
+                    break
+            resolve(state, kid, {"choice": s})
+        else:
+            print(f"Unknown pending kind: {kind}; skipping")
+            break
         drain_logs(state)
-        return
-    # draw path
-    print("AI_ACTION: draw")
-    drawn = ask_card("AI needs the drawn card, please input color+value:")
-    # Re-evaluate after draw
-    (score, pos), best_cand, cand_list = evaluate_best_place(
-        g,
-        drawn,
-        state.deck,
-        state.cfg.ai_depth,
-        state.cfg.ai_mc_samples,
-        state.cfg.ai_mc_seed,
-        top_discard=top,
-    )
-    r, c = pos
-    # Compare draw_place vs draw_discard_flip
-    can_flip_eval = g.count_hidden() > 0
-    exp_draw = state.deck.expected_value_unseen()
-    ev_after_draw_place = best_cand.baseline + best_cand.ev_delta
-    ev_after_draw_discard = float(g.known_sum()) + (exp_draw if can_flip_eval else 0.0)
-    place = (not can_flip_eval) or (ev_after_draw_place <= ev_after_draw_discard)
-    if place:
-        replaced_hidden: Optional[Card] = None
-        if not g.visible[r][c]:
-            replaced_hidden = ask_card("AI replaced a hidden card; please input it:")
-            print(f"AI_REPLACED: {replaced_hidden}")
-        ai_apply(state, "draw_place", drawn=drawn, target=(r, c), replaced_hidden=replaced_hidden)
-    else:
-        fr, fc = first_hidden(g)
-        print(f"AI_ACTION: draw; DISCARD; FLIP: ({fr},{fc})")
-        print(f"AI_DISCARDED: {drawn}")
-        revealed = ask_card("Flip result for AI (color+value):")
-        ai_apply(state, "draw_discard_flip", drawn=drawn, flipped=(fr, fc), flipped_card=revealed)
-    drain_logs(state)
 
 
 def reveal_remaining_and_resolve(state: GameState) -> None:
-    # Ask reveals for any remaining hidden cards, then resolve chains
+    # The engine's step/resolve should handle reveals during play; this helper
+    # just ensures all hidden cells are revealed before scoring (arbiter-driven).
     for p in state.players:
         g = p.grid
         for r in range(3):
@@ -261,60 +189,23 @@ def reveal_remaining_and_resolve(state: GameState) -> None:
                 if g.cells[r][c] is not None and not g.visible[r][c]:
                     print(f"Reveal remaining for {p.name} at ({r},{c})")
                     card = ask_card("Color+value:")
-                    state.deck.see_card(card)
                     g.reveal_known(r, c, card)
-        # Resolve HILO chains deterministically (best compaction automatically)
-        # Using draw_discard_flip with a dummy path would be awkward; the engine resolves on placement
-        # so here we simply re-run chain resolution by simulating internal helper via a no-op replace.
-        # This is implicitly done as part of scoring in the legacy, but we call it explicitly by placing nothing.
-        # No additional logs printed here.
-        from engine.core import _apply_hilo_chain as _internal_apply
-        _internal_apply(state, g)
+                    state.deck.see_card(card)
 
 
 def play_round(state: GameState) -> None:
-    # Collect initial reveals
-    initial_reveals: Dict[str, List[Tuple[GridPos, Card]]] = {}
     print("\n=== New Round ===")
-    print("Enter initial two reveals per active player.")
-    for p in state.players:
-        g = p.grid
-        print()
-        print_legend()
-        print(f"Initial reveals for {p.name} (two positions)")
-        picks: List[GridPos] = []
-        while len(picks) < 2:
-            r, c = ask_pos_any()
-            if (r, c) in picks:
-                print("Duplicate position; pick another.")
-                continue
-            card = ask_card(f"Card at ({r},{c}):")
-            picks.append((r, c))
-            initial_reveals.setdefault(p.id, []).append(((r, c), card))
-    # Initial discard
-    print()
-    print_legend()
-    init_top = ask_card("Initial discard (color+value):")
-    start_round(state, initial_reveals, init_top, starting_rule="highest_two_sum")
+    # Drive round using event system
+    handle_pending(state)
     print(f"Initial discard top: {state.discard[-1] if state.discard else '(empty)'}")
 
     while True:
-        if is_round_over(state):
+        handle_pending(state)
+        # Step returns with no pending when round is over or needs no input
+        if state.end_trigger_idx is not None and state.current_idx == state.end_trigger_idx:
             break
-        p = state.players[state.current_idx]
-        if p.kind == "H":
-            human_turn(state)
-        else:
-            ai_turn(state)
-        maybe_trigger_end(state)
-        top = state.discard[-1] if state.discard else None
-        print(f"Discard top now: {top if top else '(empty)'}")
-        state.current_idx = next_idx(state)
-
-    # Reveal and resolve remaining
+    # Reveal remaining and score
     reveal_remaining_and_resolve(state)
-
-    # Show final grids and score
     for p in state.players:
         print(f"\nFinal grid for {p.name}:")
         print_grid(p.grid)
@@ -355,4 +246,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
