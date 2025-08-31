@@ -7,6 +7,8 @@ from .core import (
     GameConfig,
     ExplainInfo,
     GameState,
+    to_json,
+    from_json,
     new_game,
     start_round,
     is_round_over,
@@ -31,6 +33,8 @@ __all__ = [
     "GameConfig",
     "ExplainInfo",
     "GameState",
+    "to_json",
+    "from_json",
     "new_game",
     "start_round",
     "is_round_over",
@@ -41,4 +45,3 @@ __all__ = [
     "finish_round_and_score",
     "is_game_over",
 ]
-
